@@ -13,12 +13,12 @@ import (
 // ErrGracePeriodExpired is the context.Cause of a Context whose grace period elapsed.
 var ErrGracePeriodExpired = errors.New("graceful: grace period expired")
 
-// ErrCanceled is the context.Cause of a Context cancelled by Cancel.
+// ErrCanceled is the context.Cause of a Context cancelled by the func NewContext returns.
 var ErrCanceled = errors.New("graceful: canceled")
 
 var defaultSignals = []os.Signal{syscall.SIGTERM}
 
-// shutdownKey carries the shutdown channel, so Shutdown works through wrapped contexts.
+// shutdownKey carries the shutdown-notice channel, so ShutdownNotice works through wrapped contexts.
 type shutdownKey struct{}
 
 // Context is a context.Context that signals before it cancels. Create one with NewContext.
@@ -28,7 +28,7 @@ type Context struct {
 
 	gracePeriod time.Duration
 
-	shutdownTriggerC chan struct{}
+	shutdownNoticeC chan struct{}
 
 	scheduledShutdownTriggerC    <-chan time.Time
 	scheduledShutdownTriggerTime time.Time
@@ -39,31 +39,26 @@ type Context struct {
 	signalWatcher *signalWatcher
 }
 
-// scheduleShutdownTrigger returns a timer for gracePeriod before ctx's deadline,
-// or nil if ctx has no deadline.
-func scheduleShutdownTrigger(ctx context.Context, gracePeriod time.Duration) (<-chan time.Time, time.Time) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return nil, time.Time{}
-	}
-
-	triggerTime := deadline.Add(-gracePeriod)
-	return time.After(time.Until(triggerTime)), triggerTime
-}
-
 // NewContext creates a graceful context. Shutdown begins on any of the given
 // signals, or gracePeriod before the parent's deadline. The Context is
 // cancelled gracePeriod after shutdown begins.
 //
 // Passing no signals watches SIGTERM; passing an empty non-nil slice watches none.
+// It panics if gracePeriod is negative.
 //
-// The Context and its goroutine live until it is cancelled: by Cancel, by the
-// grace period, or by the parent.
-func NewContext(parent context.Context, gracePeriod time.Duration, signals ...os.Signal) *Context {
-	shutdownTriggerC := make(chan struct{})
+// The Context and its goroutine live until it is cancelled: by the returned
+// func, by the grace period, or by the parent. That func cancels immediately,
+// skipping the grace period, and is idempotent - defer it the way you would a
+// context.CancelFunc.
+func NewContext(parent context.Context, gracePeriod time.Duration, signals ...os.Signal) (*Context, func()) {
+	if gracePeriod < 0 {
+		panic("graceful: negative grace period")
+	}
+
+	shutdownNoticeC := make(chan struct{})
 
 	// A timer, unlike a signal, cannot be missed by starting late.
-	scheduledShutdownTriggerC, scheduledShutdownTriggerTime := scheduleShutdownTrigger(parent, gracePeriod)
+	scheduledShutdownTriggerC, scheduledShutdownTriggerTime := preDeadlineTrigger(parent, gracePeriod)
 
 	manualShutdownTriggerC, manualShutdownTrigger := newTrigger()
 
@@ -72,7 +67,7 @@ func NewContext(parent context.Context, gracePeriod time.Duration, signals ...os
 	signalWatcher := newSignalWatcher(signals)
 
 	ctx, cancel := context.WithCancelCause(parent)
-	ctx = context.WithValue(ctx, shutdownKey{}, (<-chan struct{})(shutdownTriggerC))
+	ctx = context.WithValue(ctx, shutdownKey{}, (<-chan struct{})(shutdownNoticeC))
 
 	gctx := &Context{
 		ctx:    ctx,
@@ -80,7 +75,7 @@ func NewContext(parent context.Context, gracePeriod time.Duration, signals ...os
 
 		gracePeriod: gracePeriod,
 
-		shutdownTriggerC: shutdownTriggerC,
+		shutdownNoticeC: shutdownNoticeC,
 
 		scheduledShutdownTriggerC:    scheduledShutdownTriggerC,
 		scheduledShutdownTriggerTime: scheduledShutdownTriggerTime,
@@ -90,12 +85,11 @@ func NewContext(parent context.Context, gracePeriod time.Duration, signals ...os
 
 		signalWatcher: signalWatcher}
 	go gctx.awaitShutdownStart()
-	return gctx
+	return gctx, func() { cancel(ErrCanceled) }
 }
 
 // awaitShutdownStart waits for the first shutdown trigger, then starts the grace period.
 func (c *Context) awaitShutdownStart() {
-
 	select {
 	case <-c.ctx.Done():
 		c.signalWatcher.stop()
@@ -113,7 +107,9 @@ func (c *Context) awaitShutdownStart() {
 
 // runShutdown starts the grace period, then cancels the Context once it ends.
 func (c *Context) runShutdown() {
-	close(c.shutdownTriggerC)
+	// The parent can cancel between awaitShutdownStart's select and
+	// this close, so the notice may arrive with no grace left.
+	close(c.shutdownNoticeC)
 	timer := time.NewTimer(c.gracePeriod)
 	defer timer.Stop()
 
@@ -129,14 +125,9 @@ func (c *Context) TriggerShutdown() {
 	c.manualShutdownTrigger()
 }
 
-// Shutdown returns a channel closed when the grace period starts.
-func (c *Context) Shutdown() <-chan struct{} {
-	return c.shutdownTriggerC
-}
-
-// Cancel cancels the Context immediately, skipping the grace period. Idempotent.
-func (c *Context) Cancel() {
-	c.cancel(ErrCanceled)
+// ShutdownNotice returns a channel closed when the grace period starts.
+func (c *Context) ShutdownNotice() <-chan struct{} {
+	return c.shutdownNoticeC
 }
 
 // ScheduledShutdown returns when shutdown will start because of the parent's
@@ -165,31 +156,42 @@ func (c *Context) Value(key any) any {
 	return c.ctx.Value(key)
 }
 
-// Shutdown returns the shutdown channel of ctx. It works through wrapped
-// contexts, unlike a type assertion. The channel is nil when ctx is not
-// graceful, so a bare receive on it blocks forever - use Shutdownable to
-// check first.
-func Shutdown(ctx context.Context) <-chan struct{} {
+// ShutdownNotice returns the shutdown-notice channel of ctx. It works
+// through wrapped contexts, unlike a type assertion. The channel is nil
+// when ctx is not graceful: inert in a select alongside ctx.Done(), but a
+// bare receive on it blocks forever - use Shutdownable to check first.
+func ShutdownNotice(ctx context.Context) <-chan struct{} {
 	v, _ := ctx.Value(shutdownKey{}).(<-chan struct{})
 	return v
 }
 
 // Shutdownable reports whether ctx is a graceful context.
 func Shutdownable(ctx context.Context) bool {
-	return Shutdown(ctx) != nil
+	return ShutdownNotice(ctx) != nil
 }
 
 // Go runs fn on a new graceful Context and returns a func that triggers its
-// shutdown. It panics if fn is nil. The Context is cancelled when fn returns,
+// shutdown, waiting for fn to return and the Context to be cancelled if wait
+// is true. Calling it with wait true from within fn deadlocks. It panics if fn
+// is nil or gracePeriod is negative. The Context is cancelled when fn returns,
 // or sooner via that func or the parent.
-func Go(ctx context.Context, fn func(context.Context), gracePeriod time.Duration, signals ...os.Signal) func() {
+func Go(ctx context.Context, fn func(context.Context), gracePeriod time.Duration, signals ...os.Signal) func(wait bool) {
 	if fn == nil {
 		panic("graceful: Go called with nil function")
 	}
-	gctx := NewContext(ctx, gracePeriod, signals...)
+	gctx, cancel := NewContext(ctx, gracePeriod, signals...)
+
+	done := make(chan struct{})
 	go func() {
-		defer gctx.Cancel()
+		defer close(done)
+		defer cancel()
 		fn(gctx)
 	}()
-	return gctx.manualShutdownTrigger
+
+	return func(wait bool) {
+		gctx.TriggerShutdown()
+		if wait {
+			<-done
+		}
+	}
 }

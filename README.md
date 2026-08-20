@@ -1,9 +1,20 @@
-# graceful
+# `graceful` - a context that notices you before it cancels
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/r4d01/graceful.svg)](https://pkg.go.dev/github.com/r4d01/graceful)
 
-A `context.Context` that notices you before it cancels, so your code gets a
-chance to finish up instead of being cut off.
+A plain `context.Context` only gives you one signal: `Done()`. It's either
+  fine, or it's over. There's no *"start wrapping up, you have 10 seconds"*
+  in between.
+
+`graceful.Context` adds that missing signal:
+- it gives you a **graceful shutdown notification** first, closing a channel you can watch for
+- then, one grace period later, it **cancels** — unless your work
+  finishes first
+
+Shutdown can be triggered by any of:
+- an OS signal (SIGTERM by default)
+- a deadline, worked out automatically from the parent context's deadline
+- a manual call to `TriggerShutdown()`
 
 ## Install
 
@@ -11,40 +22,33 @@ chance to finish up instead of being cut off.
 go get github.com/r4d01/graceful
 ```
 
-## The problem
-
-- A plain `context.Context` only gives you one signal: `Done()`. It's either
-  fine, or it's over. There's no "start wrapping up, you have 10 seconds"
-  in between.
-- `graceful.Context` adds that missing signal:
-  - it **triggers shutdown** first, closing a channel you can watch for
-  - then, one grace period later, it **cancels** — unless your work
-    finishes first
-- Shutdown can be triggered by any of:
-  - an OS signal (SIGTERM by default)
-  - a deadline, worked out automatically from the parent context's deadline
-  - a manual call to `TriggerShutdown()`
-
 ## Usage
 
-```go
-gctx := graceful.NewContext(context.Background(), 10*time.Second, syscall.SIGTERM)
+### Basic usage
 
+```go
+gctx, cancel := graceful.NewContext(context.Background(), 10*time.Second, syscall.SIGINT, syscall.SIGTERM)
+defer cancel()
+
+srv := &http.Server{Addr: ":8080"}
 go func() {
-	<-gctx.Shutdown() // SIGTERM received, or the deadline below is 10s out
-	log.Println("shutting down, draining requests...")
+	<-gctx.ShutdownNotice()
+	srv.Shutdown(gctx) // stop accepting new requests, drain in-flight ones until the grace period ends
 }()
 
-srv.Serve(listener)
-
-<-gctx.Done() // cancelled 10s after shutdown starts, or sooner once drained
+srv.ListenAndServe()
 ```
+
+### Default signal
 
 Skip the signal list to watch SIGTERM by default:
 
 ```go
-gctx := graceful.NewContext(context.Background(), 10*time.Second)
+gctx, cancel := graceful.NewContext(context.Background(), 10*time.Second)
+defer cancel() // releases the Context and its goroutine
 ```
+
+### Deadlines from a parent context
 
 If the parent already has a deadline, `graceful.Context` triggers shutdown
 early enough to still finish its grace period by then:
@@ -53,48 +57,77 @@ early enough to still finish its grace period by then:
 parent, cancel := context.WithTimeout(context.Background(), time.Minute)
 defer cancel()
 
-gctx := graceful.NewContext(parent, 10*time.Second)
+gctx, cancelGctx := graceful.NewContext(parent, 10*time.Second)
+defer cancelGctx()
 // shutdown triggers at 50s, cancels at 60s - the parent's deadline is respected either way
 ```
 
-### Go
+If the grace period is longer than the remaining parent deadline, shutdown
+starts immediately. The parent deadline remains the hard cancellation
+deadline.
 
-`Go` runs a function on its own `graceful.Context` and returns a func to
-trigger its shutdown manually. The context is cancelled as soon as the
-function returns:
+### Run a routine with its own graceful context
+
+`Go` runs a function on its own goroutine, backed by a new `graceful.Context`,
+and returns a func to trigger its shutdown manually. The context is
+cancelled as soon as the function returns:
 
 ```go
-triggerShutdown := graceful.Go(context.Background(), func(ctx context.Context) {
-	<-ctx.Done()
+shutdown := graceful.Go(context.Background(), func(ctx context.Context) {
+	<-graceful.ShutdownNotice(ctx)
+	// wrap up before ctx.Done() fires
 }, 5*time.Second, syscall.SIGTERM)
 
 // later, e.g. from a health check or admin endpoint:
-triggerShutdown()
+shutdown(false)     // start the grace period and carry on
+shutdown(true)      // ...or block until the function has returned
 ```
 
-### Telling shutdown from a wrapped context
+Calling `shutdown(true)` from inside the function itself deadlocks - it
+would be waiting on itself.
+
+### React to a shutdown notice from any context
 
 Once a `graceful.Context` has been wrapped - by `context.WithValue`,
 `context.WithTimeout`, middleware, whatever - a type assertion back to
-`*graceful.Context` no longer works. Use the package-level `Shutdown`
-instead; it looks the channel up as a context value, so it survives
-wrapping. It returns nil for a context that isn't graceful, so a bare
-receive on it would block forever - check with `Shutdownable` first:
+`*graceful.Context` no longer works. `ShutdownNotice(ctx)` looks the
+channel up as a context value instead, so it survives wrapping. Take any
+`context.Context` and select on both it and `ctx.Done()` - no type
+assertion, no feature check:
 
 ```go
 func handler(ctx context.Context) {
-	if !graceful.Shutdownable(ctx) {
-		return // not a graceful context
-	}
 	select {
-	case <-graceful.Shutdown(ctx):
-		// shutdown has started
-	default:
+	case <-graceful.ShutdownNotice(ctx):
+		// shutdown has started, wrap up before ctx.Done() fires
+	case <-ctx.Done():
+		// out of time
 	}
 }
 ```
 
-### Telling *why* it cancelled
+`handler` works just as well on a plain context. `ShutdownNotice` returns
+nil for one, and a nil channel never fires, so that case is simply never
+chosen and the select falls through to `ctx.Done()` as it always would.
+
+The one place this needs care is a *bare* receive - `<-graceful.ShutdownNotice(ctx)`
+on its own line blocks forever on a plain context. Select on `ctx.Done()`
+alongside it, as above, or check `Shutdownable` first.
+
+### Check whether a context supports graceful shutdown
+
+The select above doesn't need it, but when you want to *ask* - to log it, to
+pick between a draining path and an abrupt one, to skip registering a hook -
+`Shutdownable` reports whether a plain `context.Context` is backed by a
+`graceful.Context` anywhere in its chain:
+
+```go
+if graceful.Shutdownable(ctx) {
+	// ctx supports graceful shutdown
+}
+```
+
+### Telling why it cancelled
 
 ```go
 <-gctx.Done()
@@ -102,13 +135,13 @@ switch {
 case errors.Is(context.Cause(gctx), graceful.ErrGracePeriodExpired):
 	// grace period ran out
 case errors.Is(context.Cause(gctx), graceful.ErrCanceled):
-	// Cancel was called
+	// the func NewContext returned was called
 default:
 	// the parent was cancelled
 }
 ```
 
-## Example
+## Example - try it by yourself
 
 [`examples/simplecli`](examples/simplecli) is a small CLI that runs up to
 10 tasks, one at a time. Run it, then press Ctrl+C: it stops picking up new
@@ -123,22 +156,22 @@ go run ./examples/simplecli
 
 | | |
 |---|---|
-| `NewContext(parent, gracePeriod, signals...)` | create a `*Context` |
+| `NewContext(parent, gracePeriod, signals...)` | create a `*Context`; returns it and a func that cancels it immediately, no grace period |
 | `(*Context).TriggerShutdown()` | start the grace period now |
-| `(*Context).Shutdown()` | channel closed when the grace period starts |
-| `(*Context).Cancel()` | cancel immediately, no grace period |
+| `(*Context).ShutdownNotice()` | channel closed when the grace period starts |
 | `(*Context).ScheduledShutdown()` | when it triggers shutdown on account of the parent's deadline |
-| `Shutdown(ctx)` | `(*Context).Shutdown()`, but works through wrapped contexts |
+| `ShutdownNotice(ctx)` | `(*Context).ShutdownNotice()`, but works through wrapped contexts |
 | `Shutdownable(ctx)` | reports whether ctx is a graceful context |
-| `Go(parent, fn, gracePeriod, signals...)` | run `fn` on a new `*Context`; returns its `TriggerShutdown` |
+| `Go(parent, fn, gracePeriod, signals...)` | run `fn` on a new `*Context`; returns a `func(wait bool)` that triggers its shutdown |
 | `ErrGracePeriodExpired`, `ErrCanceled` | `context.Cause` values |
 
 `*Context` also implements `context.Context` (`Deadline`, `Done`, `Err`,
 `Value`), so it drops into anything that already accepts one.
 
-Passing no signals to `NewContext` or `Go` watches `SIGTERM`; passing an
-explicit empty slice watches none.
+Passing no signals (`nil`, what you get by omitting the argument) to
+`NewContext` or `Go` watches `SIGTERM`; passing an explicit non-nil empty
+slice (`[]os.Signal{}`) watches none.
 
 ## License
 
-Apache 2.0 - see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
